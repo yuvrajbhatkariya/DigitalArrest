@@ -3,6 +3,7 @@ import numpy as np
 from faster_whisper import WhisperModel
 import queue
 from collections import deque
+from sentence_transformers import SentenceTransformer
 
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000   # ~250 ms
@@ -11,6 +12,12 @@ MIC_INDEX = 0       # confirmed mic
 # 1 .here we do converseation turn part(like a 1 by 1 proper sentence)
 audio_queue = queue.Queue()
 conversation_turns = deque(maxlen=10)
+
+# 2. converst sentences into vector(semantic vectors)
+turn_buffer = deque(maxlen=6)  
+embedder = SentenceTransformer(
+    "paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 
 def audio_callback(indata, frames, time, status):
@@ -52,7 +59,9 @@ def main():
                 for seg in segments:
                     turn_text = seg.text.strip().lower()
                     conversation_turns.append(turn_text)
-                    print("🗣️", turn_text)
+                    turn_embedding = embedder.encode(turn_text)
+                    turn_buffer.append(turn_embedding)
+                    print("🗣️", turn_text,turn_embedding)
 
                 buffer = np.zeros((0,), dtype=np.float32)
 
