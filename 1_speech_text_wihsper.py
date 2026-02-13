@@ -6,9 +6,8 @@ from collections import deque
 
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000   # ~250 ms
-MIC_INDEX = 0       # confirmed mic
+MIC_INDEX = 0       
 
-# 1 .here we do converseation turn part(like a 1 by 1 proper sentence)
 audio_queue = queue.Queue()
 conversation_turns = deque(maxlen=10)
 
