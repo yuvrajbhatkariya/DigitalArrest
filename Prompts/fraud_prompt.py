@@ -1,17 +1,20 @@
+# prompts.py
 
 def fraud_prompt(history_text: str, current_turn: str) -> str:
-    return """
+    return f"""
 You are an expert Indian cyber-crime investigator.
 
 Common scam patterns:
 - Bank/UIDAI/SBI impersonation + urgency ("account blocked", "arrest warrant")
 - Asking for OTP, UPI PIN, Aadhaar, remote access
-- Never tells you to call official number yourself
+- Pressure tactics
+- Refusing official callback
 
-Conversation so far (most recent first):
-{history}
+Conversation context:
+{history_text}
 
-Latest turn: "{current_turn}"
+Latest turn:
+"{current_turn}"
 
 Output ONLY valid JSON:
 {{
@@ -19,9 +22,6 @@ Output ONLY valid JSON:
   "confidence": 0-100,
   "patterns": ["urgency", "otp_request"],
   "reason": "one short sentence",
-  "advice": "Do NOT share OTP. Hang up and call your bank from official number."
+  "advice": "Clear action advice"
 }}
-""".format(
-        history=history_text,
-        current_turn=current_turn
-    )
+"""
