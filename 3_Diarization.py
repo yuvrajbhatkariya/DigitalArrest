@@ -12,8 +12,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ================= CONFIG =================
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000
-PROCESS_WINDOW = 2        # seconds for diarization
-TRANSCRIBE_WINDOW = 4     # seconds for whisper
+PROCESS_WINDOW = 2        # seconds for speaker detection
 SIM_THRESHOLD = 0.75
 MIC_INDEX = 0
 
@@ -22,10 +21,10 @@ audio_queue = queue.Queue()
 transcription_queue = queue.Queue()
 conversation_turns = deque(maxlen=50)
 
-speaker_profiles = {}   # { "User 1": embedding }
+speaker_profiles = {}
 speaker_count = 0
 
-vad = webrtcvad.Vad(2)
+vad = webrtcvad.Vad(2)  # aggressiveness 0-3
 encoder = VoiceEncoder()
 whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
 
@@ -34,6 +33,34 @@ def audio_callback(indata, frames, time_info, status):
     if status:
         print(status)
     audio_queue.put(indata.copy())
+
+# ================= FRAME-BASED VAD =================
+def has_speech(audio_float):
+    """
+    Proper WebRTC VAD usage:
+    Must pass 10ms, 20ms or 30ms frames.
+    """
+    int16_audio = (audio_float * 32768).astype(np.int16)
+
+    frame_duration = 20  # ms
+    frame_size = int(SAMPLE_RATE * frame_duration / 1000)
+
+    num_frames = len(int16_audio) // frame_size
+    if num_frames == 0:
+        return False
+
+    speech_frames = 0
+
+    for i in range(num_frames):
+        start = i * frame_size
+        end = start + frame_size
+        frame = int16_audio[start:end]
+
+        if len(frame) == frame_size:
+            if vad.is_speech(frame.tobytes(), SAMPLE_RATE):
+                speech_frames += 1
+
+    return speech_frames > 0.4 * num_frames  # 40% rule
 
 # ================= SPEAKER ASSIGNMENT =================
 def assign_speaker(new_embedding):
@@ -58,7 +85,7 @@ def assign_speaker(new_embedding):
             best_speaker = name
 
     if best_score > SIM_THRESHOLD:
-        # update running average
+        # Update running average (stabilizes identity)
         speaker_profiles[best_speaker] = (
             0.8 * speaker_profiles[best_speaker] +
             0.2 * new_embedding
@@ -72,25 +99,23 @@ def assign_speaker(new_embedding):
 # ================= DIARIZATION THREAD =================
 def diarization_worker():
     buffer = np.zeros((0,), dtype=np.float32)
-    transcribe_buffer = np.zeros((0,), dtype=np.float32)
 
     while True:
         audio = audio_queue.get()
         buffer = np.concatenate((buffer, audio[:, 0]))
-        transcribe_buffer = np.concatenate((transcribe_buffer, audio[:, 0]))
 
-        # --- DIARIZATION every PROCESS_WINDOW ---
         if len(buffer) >= SAMPLE_RATE * PROCESS_WINDOW:
 
-            int16_audio = (buffer * 32768).astype(np.int16)
+            if has_speech(buffer):
+                try:
+                    embedding = encoder.embed_utterance(buffer)
+                    speaker = assign_speaker(embedding)
 
-            if vad.is_speech(int16_audio.tobytes(), SAMPLE_RATE):
-                embedding = encoder.embed_utterance(buffer)
-                speaker = assign_speaker(embedding)
+                    # Send to transcription
+                    transcription_queue.put((speaker, buffer.copy()))
 
-                # Send chunk for transcription
-                transcription_queue.put((speaker, transcribe_buffer.copy()))
-                transcribe_buffer = np.zeros((0,), dtype=np.float32)
+                except Exception as e:
+                    print("Embedding error:", e)
 
             buffer = np.zeros((0,), dtype=np.float32)
 
@@ -99,24 +124,27 @@ def transcription_worker():
     while True:
         speaker, audio_chunk = transcription_queue.get()
 
-        segments, _ = whisper_model.transcribe(
-            audio_chunk,
-            language="en",
-            vad_filter=True,
-            beam_size=5
-        )
+        try:
+            segments, _ = whisper_model.transcribe(
+                audio_chunk,
+                language="en",
+                vad_filter=True,
+                beam_size=5
+            )
 
-        text = " ".join([seg.text.strip() for seg in segments])
+            text = " ".join([seg.text.strip() for seg in segments])
 
-        if text:
-            conversation_turns.append((speaker, text))
-            print(f"[{speaker}] {text}")
+            if text:
+                conversation_turns.append((speaker, text))
+                print(f"[{speaker}] {text}")
+
+        except Exception as e:
+            print("Whisper error:", e)
 
 # ================= MAIN =================
 def main():
     print("🎙️ Real-time diarization + Whisper medium started")
 
-    # Start worker threads
     threading.Thread(target=diarization_worker, daemon=True).start()
     threading.Thread(target=transcription_worker, daemon=True).start()
 
