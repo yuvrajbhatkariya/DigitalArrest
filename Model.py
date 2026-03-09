@@ -1,6 +1,6 @@
 import ollama
 
-MODEL = "phi3:mini"
+MODEL = "mistral:7b-instruct"
 
 while True:
     question = input("\n❓ Ask something (type 'exit' to quit): ")
