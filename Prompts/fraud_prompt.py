@@ -1,104 +1,104 @@
-# def fraud_prompt(history_text: str, current_turn: str) -> str:
-#     return f"""
-# You are a senior Indian cyber crime investigator.
-
-# Important detection rules:
-
-# 1. If the caller impersonates police, bank, RBI, UIDAI, cyber cell or government → risk must be HIGH or CRITICAL.
-# 2. If the caller asks for OTP, UPI PIN, CVV, ATM PIN, Aadhaar, or remote access → risk must be CRITICAL.
-# 3. If the caller pressures the victim or threatens arrest → risk must be HIGH or CRITICAL.
-# 4. If earlier conversation already shows scam signals, never downgrade risk.
-
-# Conversation history:
-# {history_text}
-
-# Current message:
-# "{current_turn}"
-
-# Return ONLY valid JSON:
-
-# {{
-#   "risk_level": "low|medium|high|critical",
-#   "confidence": 0-100,
-#   "patterns": ["authority_impersonation","financial_request"],
-#   "reason": "one sentence explaining why it is fraud or not",
-#   "advice": "clear action for the user"
-# }}
-# """
-
-def fraud_prompt(conversation_summary: str, recent_history: str, current_turn: str) -> str:
-    """
-    Generate a prompt for fraud detection with conversation context.
-    
-    Args:
-        conversation_summary: Summary of older conversation turns
-        recent_history: Last 6 turns of conversation
-        current_turn: Current speech turn to analyze
-    
-    Returns:
-        Formatted prompt string for the LLM
-    """
-    return f"""
-You are a senior Indian cyber crime investigator with expertise in identifying fraudulent communication patterns.
-
-IMPORTANT DETECTION RULES:
-1. If the caller impersonates police, bank, RBI, UIDAI, cyber cell or government → risk must be HIGH or CRITICAL.
-2. If the caller asks for OTP, UPI PIN, CVV, ATM PIN, Aadhaar, or remote access → risk must be CRITICAL.
-3. If the caller pressures the victim or threatens arrest → risk must be HIGH or CRITICAL.
-4. If earlier conversation already shows scam signals, never downgrade risk.
-5. If the caller creates urgency or claims limited time offers → increase risk level.
-6. If the caller requests payment through unusual methods (gift cards, crypto) → risk must be HIGH or CRITICAL.
-
-CONVERSATION SUMMARY:
-{conversation_summary}
-
-RECENT CONVERSATION (Last 6 turns):
-{recent_history}
-
-CURRENT MESSAGE:
-"{current_turn}"
-
-Analyze the current message in the context of the entire conversation. Consider:
-- How the conversation has evolved
-- Any escalation in urgency or threats
-- Requests for sensitive information
-- Attempts to establish authority
-
-Return ONLY valid JSON:
-
-{{
-  "risk_level": "low|medium|high|critical",
-  "confidence": 0-100,
-  "patterns": ["authority_impersonation","financial_request","urgency_creation","threat","information_seeking"],
-  "reason": "Detailed explanation of why this is considered fraud or not, referencing specific elements from the conversation",
-  "advice": "Clear, actionable advice for the user based on the current risk level",
-  "escalation_detected": true/false,
-  "key_red_flags": ["list of specific red flags detected in this turn"]
-}}
+"""
+Fraud Detection Prompts  –  v2
+==============================
+Changes from v1
+───────────────
+• Detection prompt is more concise (fewer tokens → faster inference).
+• Summary prompt now explicitly asks the LLM to preserve risk levels,
+  so compressed history always carries threat-level context.
+• build_detection_prompt receives the full annotated history (risk baked in).
 """
 
-def summarize_conversation_prompt(conversation_text: str) -> str:
-    """
-    Generate a prompt to summarize conversation history.
-    
-    Args:
-        conversation_text: Text to summarize
-    
-    Returns:
-        Formatted prompt string for the LLM
-    """
-    return f"""
-Summarize the following conversation, focusing on:
-- Key topics discussed
-- Any requests for personal information
-- Claims of authority
-- Urgency or pressure tactics
-- Financial requests or discussions
 
-Keep the summary concise but preserve important context that would help identify fraud patterns.
+SYSTEM_PROMPT = """You are a senior Indian cyber crime investigator (15+ years) \
+specialising in digital arrest scams, UPI/OTP fraud, and impersonation fraud.
 
-CONVERSATION:
-{conversation_text}
+Analyse spoken conversation transcripts in real-time.
 
-Return a concise summary (max 200 words):
+=== HARD RULES (never override) ===
+R1  Impersonates Police/CBI/ED/RBI/UIDAI/TRAI/Cyber Cell/any govt body → HIGH or CRITICAL
+R2  Requests OTP, UPI PIN, CVV, ATM PIN, Aadhaar, PAN, remote-access app → CRITICAL
+R3  Threatens arrest, summons, account freeze, or jail → HIGH or CRITICAL
+R4  Prior turns already flagged HIGH/CRITICAL → never downgrade risk
+R5  Creates urgency ("act now", "30 minutes") or asks victim to hide call → HIGH
+
+=== OUTPUT ===
+Return ONLY valid JSON — no markdown, no preamble.
 """
+
+
+def build_detection_prompt(
+    summary: str,
+    recent_turns: list[str],
+    current_window: str,
+) -> str:
+    """
+    Build the per-window detection prompt.
+
+    Parameters
+    ----------
+    summary        : Compressed history INCLUDING risk verdicts (may be empty).
+    recent_turns   : Last MAX_RECENT_TURNS raw transcripts (no risk annotation).
+    current_window : The 30-second transcript to analyse now.
+    """
+    parts: list[str] = []
+
+    # ── Compressed history (short, includes risk context) ──────────────────
+    if summary:
+        parts.append(
+            "=== CASE HISTORY (compressed, includes prior risk levels) ===\n"
+            + summary.strip()
+        )
+
+    # ── Recent verbatim turns (exact wording matters for fraud signals) ─────
+    if recent_turns:
+        lines = "\n".join(f"  [{i+1}] {t}" for i, t in enumerate(recent_turns))
+        parts.append(f"=== RECENT TURNS (verbatim) ===\n{lines}")
+
+    # ── Current window ──────────────────────────────────────────────────────
+    parts.append(
+        f"=== CURRENT 30-SECOND WINDOW ===\n{current_window.strip()}"
+    )
+
+    context_block = "\n\n".join(parts)
+
+    return (
+        f"{context_block}\n\n"
+        "Analyse the CURRENT WINDOW using the context above.\n"
+        "Return ONLY this JSON:\n\n"
+        "{\n"
+        '  "risk_level": "low|medium|high|critical",\n'
+        '  "confidence": 0-100,\n'
+        '  "patterns": ["detected fraud patterns, empty list if none"],\n'
+        '  "triggered_rules": ["R1"..."R5" labels that fired, empty if none"],\n'
+        '  "reason": "one sentence: why fraud or not",\n'
+        '  "prior_context_used": "how earlier turns influenced verdict, or N/A",\n'
+        '  "advice": "specific actionable advice for the person being targeted"\n'
+        "}"
+    )
+
+
+def build_summary_prompt(annotated_turns: list[str]) -> str:
+    """
+    Compress annotated turns (format: "[RISK CONF%] text") into a short
+    investigator note.  The risk labels MUST survive into the summary so
+    future detection calls always know the historical threat level.
+
+    Parameters
+    ----------
+    annotated_turns : Turns already labelled with [RISK CONF%] prefix.
+    """
+    formatted = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(annotated_turns))
+
+    return (
+        "You are an Indian cyber crime investigator updating a case log.\n\n"
+        "Compress the following turns into a 3-5 sentence investigator note.\n"
+        "YOU MUST INCLUDE:\n"
+        "  • Any impersonation claims or government body mentions\n"
+        "  • Financial / OTP / credential requests\n"
+        "  • Threats, urgency tactics, or isolation attempts\n"
+        "  • The highest risk level reached so far (e.g. 'Risk escalated to HIGH')\n\n"
+        "PLAIN TEXT ONLY — no JSON, no bullet points, no markdown.\n\n"
+        f"=== TURNS ===\n{formatted}\n\n"
+        "Write the investigator summary now:"
+    )

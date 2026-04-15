@@ -1,163 +1,192 @@
 """
-Real-Time Fraud Detector  ─  Speed-Optimised
-=============================================
-Pipeline (3 parallel threads, zero blocking on main):
-
-  [Thread 1] Audio capture + VAD   →  transcription_queue
-  [Thread 2] Whisper transcription  →  llm_queue
-  [Thread 3] LLM fraud detection   →  prints result
-  [Thread 4] Async summarisation   (daemon, fires only when needed)
-
-Speed choices:
-  • Whisper  : "small" by default (~3x faster than medium, still accurate for Hinglish)
-               On Apple Silicon → pip install mlx-whisper and set USE_MLX_WHISPER=True (~10x)
-  • LLM      : llama3.2:3b-instruct  (fastest good-JSON model in ollama)
-               Swap to mistral:7b-instruct for higher accuracy
-  • num_predict capped at 250 (enough for JSON, cuts generation time)
-  • LLM pre-warmed at startup — eliminates cold-start on first turn
-  • Summarisation is a daemon thread — never blocks detection
+Real-Time Fraud Detector  ─  Sliding-Window + Async Architecture
+=================================================================
+Key improvements over v1
+────────────────────────
+1. Sliding-window audio  : 30 s warm-up → 15 s slides with 15 s overlap.
+                           Each LLM call sees ≥ 30 s of speech — far more
+                           context than a single VAD turn.
+2. Non-blocking LLM      : Detection runs in a background thread; audio
+                           capture never pauses waiting for Ollama.
+3. Smart memory          : Summary stores *risk verdicts* too, so the LLM
+                           always knows the running threat level — not just
+                           what was said.
+4. Dedup guard           : Near-identical consecutive transcripts are skipped
+                           (handles VAD re-triggers on silence).
+5. Confidence gate       : Windows with < MIN_WORDS words are discarded
+                           (avoids spurious detections on filler audio).
 """
 
+import difflib
 import json
 import queue
-import signal
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import ollama
 import sounddevice as sd
+from faster_whisper import WhisperModel
 from silero_vad import VADIterator, load_silero_vad
 
-from Prompts.summary_prompt import (
+from Prompts.fraud_prompt import (
     SYSTEM_PROMPT,
     build_detection_prompt,
     build_summary_prompt,
 )
 
-# ──────────────────────────────────────────────────────────
-#  CONFIG
-# ──────────────────────────────────────────────────────────
-SAMPLE_RATE       = 16000
-BLOCK_SIZE        = 512
-MIN_AUDIO_SECONDS = 0.4
+# ─────────────────────────────── CONFIG ────────────────────────────────────
 
-# Whisper — "small" is 3x faster than "medium" with minimal accuracy loss
-# Set USE_MLX_WHISPER = True on Apple Silicon (M1/M2/M3) for ~10x speedup
-WHISPER_SIZE      = "medium"
-USE_MLX_WHISPER   = False     # pip install mlx-whisper → then flip to True
+SAMPLE_RATE   = 16_000
+BLOCK_SIZE    = 512
+WHISPER_SIZE  = "medium"          # "small" = faster, "medium" = more accurate
+LLM_MODEL     = "phi3:mini"
 
-# LLM — swap to "mistral:7b-instruct" for better accuracy at cost of speed
-LLM_MODEL         = "mistral:7b-instruct"
-LLM_MAX_TOKENS    = 250
+# Sliding window parameters (in seconds)
+WINDOW_SECONDS  = 30              # how much audio each LLM call sees
+SLIDE_SECONDS   = 15              # how often we fire a new LLM call
+MIN_WORDS       = 6               # ignore windows with fewer words (noise)
 
-# History
-SUMMARY_THRESHOLD  = 6
-RECENT_TURNS_LIMIT = 4
+# Memory parameters
+MAX_RECENT_TURNS   = 3            # raw turns kept alongside compressed summary
+COMPRESS_EVERY     = 5            # compress after every N turns
 
-# ──────────────────────────────────────────────────────────
-#  INTER-THREAD QUEUES  +  SHUTDOWN EVENT
-# ──────────────────────────────────────────────────────────
-audio_q         : queue.Queue = queue.Queue()
-transcription_q : queue.Queue = queue.Queue()
-llm_q           : queue.Queue = queue.Queue()
-_shutdown                     = threading.Event()
+DEDUP_THRESHOLD    = 0.85         # Jaccard similarity above this = skip LLM
 
+DIVIDER = "─" * 62
 
-# ──────────────────────────────────────────────────────────
-#  WHISPER LOADER
-# ──────────────────────────────────────────────────────────
-def load_whisper():
-    if USE_MLX_WHISPER:
-        try:
-            import mlx_whisper
-            print(f"  ✅ MLX Whisper ({WHISPER_SIZE}) — Apple Silicon fast path")
-            return mlx_whisper, "mlx"
-        except ImportError:
-            print("  ⚠️  mlx-whisper not installed, falling back to faster-whisper")
-    from faster_whisper import WhisperModel
-    model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
-    print(f"  ✅ faster-whisper ({WHISPER_SIZE}  int8/CPU)")
-    return model, "faster"
+# ─────────────────────────────── MEMORY ────────────────────────────────────
 
-
-def transcribe(obj, kind: str, audio: np.ndarray) -> str:
-    if kind == "mlx":
-        result = obj.transcribe(
-            audio,
-            path_or_hf_repo=f"mlx-community/whisper-{WHISPER_SIZE}-mlx",
-        )
-        return result.get("text", "").strip()
-    segments, _ = obj.transcribe(audio, language="en", vad_filter=True)
-    return " ".join(s.text.strip() for s in segments).strip()
-
-
-# ──────────────────────────────────────────────────────────
-#  CONVERSATION MEMORY  (thread-safe)
-# ──────────────────────────────────────────────────────────
-@dataclass
+@dataclassœ
 class ConversationMemory:
-    summary     : str   = ""
-    recent_turns: deque = field(default_factory=lambda: deque(maxlen=RECENT_TURNS_LIMIT))
-    _raw_buffer : list  = field(default_factory=list)
-    _lock       : threading.Lock = field(default_factory=threading.Lock)
+    """
+    Two-tier rolling memory
+    ───────────────────────
+    tier-1  summary      : LLM-compressed narrative of all older turns,
+                           INCLUDING the risk levels that were detected.
+                           Grows slowly; capped by summarisation.
+    tier-2  recent_turns : Raw deque of last MAX_RECENT_TURNS entries.
+                           Always sent verbatim so the LLM has exact wording.
 
-    def add_turn(self, text: str) -> bool:
-        """Returns True when summarisation should be triggered."""
-        with self._lock:
-            self._raw_buffer.append(text)
-            self.recent_turns.append(text)
-            return len(self._raw_buffer) >= SUMMARY_THRESHOLD
+    Why store risk in summary?
+        The LLM must know "Turn 3 was already HIGH risk" without re-reading
+        the whole conversation.  Baking it into the summary achieves this
+        in ~1-2 sentences instead of N full turns.
+    """
 
-    def snapshot(self) -> tuple:
-        """Thread-safe (summary, recent_turns_minus_last) for the prompt."""
-        with self._lock:
-            return self.summary, list(self.recent_turns)[:-1]
+    summary: str = ""
+    recent_turns: deque = field(
+        default_factory=lambda: deque(maxlen=MAX_RECENT_TURNS)
+    )
+    _buffer: list = field(default_factory=list)   # unsummarised turns
 
-    def compress_async(self) -> None:
-        """Called in a daemon thread — summarises, never blocks detection."""
-        with self._lock:
-            to_summarize = self._raw_buffer[:SUMMARY_THRESHOLD]
-            self._raw_buffer = self._raw_buffer[SUMMARY_THRESHOLD:]
+    # ── public interface ────────────────────────────────────────────────────
 
-        prompt = build_summary_prompt(to_summarize)
+    def add_turn(self, text: str, risk: str = "low", confidence: int = 0) -> None:
+        """
+        Record a new analysed turn.
+        `risk` and `confidence` are woven into the summary so future
+        LLM calls always know the historical threat level.
+        """
+        annotated = f"[{risk.upper()} {confidence}%] {text}"
+        self._buffer.append(annotated)
+        self.recent_turns.append(text)          # keep raw text in recent tier
+
+        if len(self._buffer) >= COMPRESS_EVERY:
+            self._compress()
+
+    def get_context(self) -> tuple[str, list[str]]:
+        """
+        Returns (summary_str, recent_raw_turns_list).
+        The caller feeds these directly into the detection prompt.
+        """
+        return self.summary, list(self.recent_turns)
+
+    # ── internals ──────────────────────────────────────────────────────────
+
+    def _compress(self) -> None:
+        to_compress     = self._buffer[: COMPRESS_EVERY]
+        self._buffer    = self._buffer[COMPRESS_EVERY :]
+
+        prompt = build_summary_prompt(to_compress)
         try:
             resp = ollama.generate(
                 model=LLM_MODEL,
                 prompt=prompt,
-                options={"temperature": 0.0, "num_predict": 180},
+                options={"temperature": 0.0, "num_predict": 220},
             )
-            new_s = resp["response"].strip()
-        except Exception as e:
-            new_s = f"[summary error: {e}]"
+            new_chunk = resp["response"].strip()
+        except Exception as exc:
+            new_chunk = f"[Summary error: {exc}]"
 
-        with self._lock:
-            self.summary = (
-                f"{self.summary}\n[Update]: {new_s}" if self.summary else new_s
-            )
-        print(f"\n  📋 Context compressed ({SUMMARY_THRESHOLD} turns → summary)\n")
+        # Append to running summary with a visual separator
+        if self.summary:
+            self.summary = f"{self.summary}\n[+] {new_chunk}"
+        else:
+            self.summary = new_chunk
 
-
-# ──────────────────────────────────────────────────────────
-#  LLM
-# ──────────────────────────────────────────────────────────
-def warmup_llm() -> None:
-    try:
-        ollama.chat(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": "hi"}],
-            options={"num_predict": 1},
+        print(
+            f"\n📋  Memory compressed  "
+            f"({COMPRESS_EVERY} turns → summary, "
+            f"summary ≈ {len(self.summary.split())} words)\n"
         )
-        print(f"  ✅ LLM pre-warmed ({LLM_MODEL})")
-    except Exception as e:
-        print(f"  ⚠️  LLM warmup failed: {e}")
 
 
-def detect_fraud(summary: str, recent: list, current_turn: str) -> dict:
-    user_prompt = build_detection_prompt(summary, recent, current_turn)
-    raw = ""
+# ───────────────────────────── SLIDING WINDOW ──────────────────────────────
+
+class SlidingAudioBuffer:
+    """
+    Maintains a ring-buffer of raw float32 audio.
+    Produces windows of WINDOW_SECONDS every SLIDE_SECONDS.
+
+    ┌──────────────────────── WINDOW_SECONDS ────────────────────────┐
+    │  ░░░░░░░░░░░░░░░  (old half, overlap)  │  ████████████████████  │
+    └────────────────────────────────────────┴───────────────────────┘
+                                              ↑ SLIDE_SECONDS of new audio
+    """
+
+    def __init__(self) -> None:
+        self._window_len = WINDOW_SECONDS * SAMPLE_RATE
+        self._slide_len  = SLIDE_SECONDS  * SAMPLE_RATE
+        self._buf        = np.array([], dtype=np.float32)
+        self._last_fire  = 0.0   # timestamp of last window dispatch
+
+    def push(self, chunk: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Append `chunk` and return a window array when enough new audio
+        has accumulated; otherwise return None.
+        """
+        self._buf = np.concatenate((self._buf, chunk))
+
+        # Keep buffer from growing forever (2 × window is plenty)
+        max_keep = self._window_len * 2
+        if len(self._buf) > max_keep:
+            self._buf = self._buf[-max_keep :]
+
+        now = time.monotonic()
+        if (
+            len(self._buf) >= self._window_len
+            and (now - self._last_fire) >= SLIDE_SECONDS
+        ):
+            self._last_fire = now
+            return self._buf[-self._window_len :]   # newest WINDOW_SECONDS
+
+        return None
+
+
+# ─────────────────────────── LLM FRAUD DETECTION ───────────────────────────
+
+def detect_fraud(memory: ConversationMemory, window_text: str) -> dict:
+    """
+    Calls Ollama with system + user prompt.  Returns parsed result dict.
+    Falls back gracefully on JSON/network errors.
+    """
+    summary, recent = memory.get_context()
+    user_prompt     = build_detection_prompt(summary, recent, window_text)
+
     try:
         resp = ollama.chat(
             model=LLM_MODEL,
@@ -165,206 +194,192 @@ def detect_fraud(summary: str, recent: list, current_turn: str) -> dict:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            options={"temperature": 0.0, "num_predict": LLM_MAX_TOKENS},
+            options={"temperature": 0.0, "num_predict": 400},
             format="json",
         )
         raw = resp["message"]["content"].strip()
         return json.loads(raw)
+
     except json.JSONDecodeError:
+        # Attempt to salvage JSON from markdown fences
         try:
             cleaned = raw.split("```json")[-1].split("```")[0].strip()
             return json.loads(cleaned)
         except Exception:
             pass
-        return _fallback(f"JSON parse error: {raw[:60]}")
-    except Exception as e:
-        return _fallback(str(e))
+        return _fallback("JSON parse error")
+    except Exception as exc:
+        return _fallback(str(exc))
 
 
 def _fallback(reason: str) -> dict:
     return {
-        "risk_level": "low", "confidence": 0,
-        "patterns": [], "triggered_rules": [],
-        "reason": reason, "prior_context_used": "",
-        "advice": "Analysis failed — keep listening carefully.",
+        "risk_level":        "low",
+        "confidence":        0,
+        "patterns":          [],
+        "triggered_rules":   [],
+        "reason":            reason,
+        "prior_context_used": "N/A",
+        "advice":            "Analysis unavailable — stay vigilant.",
     }
 
 
-# ──────────────────────────────────────────────────────────
-#  OUTPUT
-# ──────────────────────────────────────────────────────────
-RISK_ICONS = {"low": "🟢", "medium": "🟡", "high": "🔴", "critical": "🚨"}
-DIV = "─" * 62
+# ──────────────────────────── DEDUP HELPER ─────────────────────────────────
 
-def print_result(turn_text: str, result: dict, turn_num: int, elapsed: float) -> None:
+def _similarity(a: str, b: str) -> float:
+    """Word-level Jaccard similarity (fast, good enough for dedup)."""
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a.lower().split()), set(b.lower().split())
+    inter  = sa & sb
+    union  = sa | sb
+    return len(inter) / len(union) if union else 0.0
+
+
+# ────────────────────────── OUTPUT FORMATTING ──────────────────────────────
+
+RISK_ICONS = {"low": "🟢", "medium": "🟡", "high": "🔴", "critical": "🚨"}
+
+def print_result(window_text: str, result: dict, window_num: int) -> None:
     risk     = result.get("risk_level", "low").lower()
     conf     = result.get("confidence", 0)
     patterns = result.get("patterns", [])
     rules    = result.get("triggered_rules", [])
     reason   = result.get("reason", "")
-    ctx      = result.get("prior_context_used", "")
+    context  = result.get("prior_context_used", "")
     advice   = result.get("advice", "")
     icon     = RISK_ICONS.get(risk, "⚪")
 
-    print(f"\n{DIV}")
-    print(f"🎙️  Turn #{turn_num}  [{elapsed:.1f}s total]")
-    print(f"    \"{turn_text}\"")
-    print(DIV)
-    print(f"{icon}  RISK : {risk.upper():<8}  Confidence: {conf}%")
+    print(f"\n{DIVIDER}")
+    print(f"🎙️  Window #{window_num}  ({WINDOW_SECONDS}s slide)")
+    # Truncate long transcripts in the console header
+    preview = window_text if len(window_text) <= 120 else window_text[:117] + "…"
+    print(f"   {preview}")
+    print(DIVIDER)
+    print(f"{icon}  RISK : {risk.upper():<8}  |  Confidence : {conf}%")
+
     if patterns:
-        print(f"🔍  Patterns       : {', '.join(patterns)}")
+        print(f"🔍  Patterns      : {', '.join(patterns)}")
     if rules:
-        print(f"⚖️   Rules triggered : {', '.join(str(r) for r in rules)}")
-    print(f"💬  Reason         : {reason}")
-    if ctx and ctx.strip().lower() not in ("n/a", "none", ""):
-        print(f"📜  Prior context  : {ctx}")
-    print(f"✅  Advice         : {advice}")
+        print(f"⚖️   Rules Fired   : {', '.join(rules)}")
+
+    print(f"💬  Reason        : {reason}")
+    if context and context.strip().lower() not in ("n/a", "none", ""):
+        print(f"📜  Prior context : {context}")
+    print(f"✅  Advice        : {advice}")
 
     if risk in ("high", "critical"):
         print()
-        print("⚠️  ══════════════════════════════════════════════════════ ⚠️")
-        print("⚠️      🚨  IMMEDIATE ACTION: HANG UP THE CALL NOW!  🚨      ⚠️")
-        print("⚠️  ══════════════════════════════════════════════════════ ⚠️")
-    print(DIV)
+        print("⚠️  ══════════════════════════════════════════════════ ⚠️")
+        print("⚠️        !! HANG UP THE CALL IMMEDIATELY !!            ⚠️")
+        print("⚠️  ══════════════════════════════════════════════════ ⚠️")
+
+    print(DIVIDER)
 
 
-# ──────────────────────────────────────────────────────────
-#  THREAD 1 — Audio capture + VAD
-# ──────────────────────────────────────────────────────────
-def audio_vad_thread(vad_model) -> None:
-    vad = VADIterator(
+# ──────────────────────────────── MAIN ─────────────────────────────────────
+
+audio_queue: queue.Queue = queue.Queue()
+
+def _audio_callback(indata, frames, time_info, status):
+    if status:
+        print(f"[audio] {status}", flush=True)
+    audio_queue.put(indata.copy().flatten())
+
+
+def _detection_worker(
+    whisper,
+    memory:          ConversationMemory,
+    window_counter:  list,           # mutable int wrapper
+    last_transcript: list,           # mutable str wrapper
+    window:          np.ndarray,
+) -> None:
+    """
+    Runs in a background thread.
+    Transcribes `window`, skips duplicates, runs LLM, prints result.
+    """
+    segments, _ = whisper.transcribe(window, language="en", vad_filter=True)
+    text = " ".join(s.text.strip() for s in segments).strip()
+
+    if not text or len(text.split()) < MIN_WORDS:
+        return   # too short / empty — skip silently
+
+    # ── Dedup check ────────────────────────────────────────────────────────
+    prev = last_transcript[0]
+    sim  = _similarity(text, prev)
+    if sim >= DEDUP_THRESHOLD:
+        print(f"\n[dedup] Window skipped (similarity={sim:.2f})")
+        return
+    last_transcript[0] = text
+
+    # ── LLM detection ──────────────────────────────────────────────────────
+    result = detect_fraud(memory, text)
+
+    risk = result.get("risk_level", "low")
+    conf = result.get("confidence", 0)
+
+    # Store annotated turn AFTER getting the verdict
+    memory.add_turn(text, risk=risk, confidence=conf)
+
+    window_counter[0] += 1
+    print_result(text, result, window_counter[0])
+
+
+def main() -> None:
+    print("Loading models …")
+    whisper   = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
+    vad_model = load_silero_vad()
+    vad       = VADIterator(
         vad_model,
         threshold=0.5,
         sampling_rate=SAMPLE_RATE,
-        min_silence_duration_ms=700,   # slightly tighter → faster turn detection
+        min_silence_duration_ms=600,
     )
-    buffer        = np.array([], dtype=np.float32)
-    speech_active = False
 
-    def callback(indata, frames, time_info, status):
-        if status:
-            print(f"[audio] {status}")
-        audio_q.put(indata.copy().flatten())
+    memory          = ConversationMemory()
+    slide_buf       = SlidingAudioBuffer()
+    window_counter  = [0]          # list = mutable reference across threads
+    last_transcript = [""]         # for dedup
+
+    print(f"\n{'═'*62}")
+    print(f"  🛡️  Real-Time Fraud Detector  |  Model : {LLM_MODEL}")
+    print(f"  ⏱️  Window : {WINDOW_SECONDS}s   Slide : {SLIDE_SECONDS}s   "
+          f"Min words : {MIN_WORDS}")
+    print(f"{'═'*62}")
+    print("  Speak normally.  First alert fires after ~30 s of audio.")
+    print("  Press Ctrl+C to stop.\n")
 
     stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1,
-        dtype="float32", blocksize=BLOCK_SIZE,
-        callback=callback,
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=BLOCK_SIZE,
+        callback=_audio_callback,
     )
     stream.start()
+
     try:
-        while not _shutdown.is_set():
-            try:
-                chunk = audio_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
+        while True:
+            chunk  = audio_queue.get()
+            window = slide_buf.push(chunk)
 
-            buffer = np.concatenate((buffer, chunk))
-            ev = vad(chunk)
-            if ev is None:
-                continue
+            if window is None:
+                continue   # not enough audio yet — keep buffering
 
-            if ev.get("start") is not None:
-                speech_active = True
-            elif ev.get("end") is not None and speech_active:
-                speech_active = False
-                if len(buffer) >= SAMPLE_RATE * MIN_AUDIO_SECONDS:
-                    transcription_q.put(buffer.copy())
-                buffer = np.array([], dtype=np.float32)
+            # ── Fire detection in background (non-blocking) ────────────────
+            t = threading.Thread(
+                target=_detection_worker,
+                args=(whisper, memory, window_counter, last_transcript, window),
+                daemon=True,
+            )
+            t.start()
+
+    except KeyboardInterrupt:
+        print("\n\nStopped. Goodbye.")
     finally:
         stream.stop()
         stream.close()
         vad.reset_states()
-
-
-# ──────────────────────────────────────────────────────────
-#  THREAD 2 — Whisper transcription
-# ──────────────────────────────────────────────────────────
-def transcription_thread(whisper_obj, whisper_type: str, memory: ConversationMemory) -> None:
-    while not _shutdown.is_set():
-        try:
-            audio = transcription_q.get(timeout=0.2)
-        except queue.Empty:
-            continue
-
-        t0   = time.time()
-        text = transcribe(whisper_obj, whisper_type, audio)
-        if not text:
-            continue
-
-        needs_compress = memory.add_turn(text)
-        snap           = memory.snapshot()
-
-        if needs_compress:
-            threading.Thread(target=memory.compress_async, daemon=True).start()
-
-        llm_q.put((text, snap, t0))
-        print(f"\n  🎙️  Transcribed [{time.time()-t0:.1f}s]: {text}")
-
-
-# ──────────────────────────────────────────────────────────
-#  THREAD 3 — LLM fraud detection
-# ──────────────────────────────────────────────────────────
-def llm_thread() -> None:
-    turn_num = 0
-    while not _shutdown.is_set():
-        try:
-            text, (summary, recent), t0 = llm_q.get(timeout=0.2)
-        except queue.Empty:
-            continue
-
-        turn_num += 1
-        result    = detect_fraud(summary, recent, text)
-        elapsed   = time.time() - t0
-        print_result(text, result, turn_num, elapsed)
-
-
-# ──────────────────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────────────────
-def main() -> None:
-    print(f"\n{'═'*62}")
-    print("  🛡️  Real-Time Fraud Detector  (Speed-Optimised)")
-    print(f"{'═'*62}")
-    print(f"  Whisper : {WHISPER_SIZE}{'  [MLX — Apple Silicon]' if USE_MLX_WHISPER else '  [CPU int8]'}")
-    print(f"  LLM     : {LLM_MODEL}")
-    print(f"  History : {RECENT_TURNS_LIMIT} recent turns + auto-summary every {SUMMARY_THRESHOLD}")
-    print(f"{'═'*62}\n")
-    print("Loading models …")
-
-    whisper_obj, whisper_type = load_whisper()
-    vad_model                 = load_silero_vad()
-    memory                    = ConversationMemory()
-
-    print("Pre-warming LLM (eliminates cold-start on first turn) …")
-    warmup_llm()
-
-    print(f"\n  ✅ Ready.  Speak naturally.  Press Ctrl+C to stop.\n")
-
-    threads = [
-        threading.Thread(target=audio_vad_thread,
-                         args=(vad_model,), daemon=True, name="AudioVAD"),
-        threading.Thread(target=transcription_thread,
-                         args=(whisper_obj, whisper_type, memory),
-                         daemon=True, name="Whisper"),
-        threading.Thread(target=llm_thread, daemon=True, name="LLM"),
-    ]
-    for t in threads:
-        t.start()
-
-    def _sigint(sig, frame):
-        print("\n\n  Shutting down …")
-        _shutdown.set()
-
-    signal.signal(signal.SIGINT, _sigint)
-
-    while not _shutdown.is_set():
-        time.sleep(0.2)
-
-    for t in threads:
-        t.join(timeout=2)
-
-    print("  Stopped. Goodbye.\n")
 
 
 if __name__ == "__main__":

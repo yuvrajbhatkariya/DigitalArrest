@@ -46,3 +46,5 @@ vosk-model-small-en-us-0.15/
 models/
 *.onnx
 *.tar.bz2
+
+Test/US-Economic-News.csv
