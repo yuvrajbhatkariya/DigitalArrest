@@ -1,22 +1,3 @@
-"""
-Real-Time Fraud Detector  ─  Sliding-Window + Async Architecture
-=================================================================
-Key improvements over v1
-────────────────────────
-1. Sliding-window audio  : 30 s warm-up → 15 s slides with 15 s overlap.
-                           Each LLM call sees ≥ 30 s of speech — far more
-                           context than a single VAD turn.
-2. Non-blocking LLM      : Detection runs in a background thread; audio
-                           capture never pauses waiting for Ollama.
-3. Smart memory          : Summary stores *risk verdicts* too, so the LLM
-                           always knows the running threat level — not just
-                           what was said.
-4. Dedup guard           : Near-identical consecutive transcripts are skipped
-                           (handles VAD re-triggers on silence).
-5. Confidence gate       : Windows with < MIN_WORDS words are discarded
-                           (avoids spurious detections on filler audio).
-"""
-
 import difflib
 import json
 import queue
@@ -30,9 +11,9 @@ import numpy as np
 import ollama
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from silero_vad import VADIterator, load_silero_vad
 
-from Prompts.fraud_prompt import (
+
+from Prompts.p2 import (
     SYSTEM_PROMPT,
     build_detection_prompt,
     build_summary_prompt,
@@ -42,13 +23,13 @@ from Prompts.fraud_prompt import (
 
 SAMPLE_RATE   = 16_000
 BLOCK_SIZE    = 512
-WHISPER_SIZE  = "medium"          # "small" = faster, "medium" = more accurate
+WHISPER_SIZE  = "medium"          # "small" = faster
 LLM_MODEL     = "phi3:mini"
 
 # Sliding window parameters (in seconds)
-WINDOW_SECONDS  = 30              # how much audio each LLM call sees
+WINDOW_SECONDS  = 20          # how much audio each LLM call sees
 SLIDE_SECONDS   = 15              # how often we fire a new LLM call
-MIN_WORDS       = 6               # ignore windows with fewer words (noise)
+MIN_WORDS       = 4               # ignore windows with fewer words (noise)
 
 # Memory parameters
 MAX_RECENT_TURNS   = 3            # raw turns kept alongside compressed summary
@@ -60,7 +41,7 @@ DIVIDER = "─" * 62
 
 # ─────────────────────────────── MEMORY ────────────────────────────────────
 
-@dataclassœ
+@dataclass
 class ConversationMemory:
     """
     Two-tier rolling memory
@@ -133,6 +114,9 @@ class ConversationMemory:
             f"({COMPRESS_EVERY} turns → summary, "
             f"summary ≈ {len(self.summary.split())} words)\n"
         )
+        print("\n🧠 ================= SUMMARY UPDATE =================")
+        print(self.summary)
+        print("===================================================\n")
 
 
 # ───────────────────────────── SLIDING WINDOW ──────────────────────────────
@@ -328,13 +312,6 @@ def _detection_worker(
 def main() -> None:
     print("Loading models …")
     whisper   = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
-    vad_model = load_silero_vad()
-    vad       = VADIterator(
-        vad_model,
-        threshold=0.5,
-        sampling_rate=SAMPLE_RATE,
-        min_silence_duration_ms=600,
-    )
 
     memory          = ConversationMemory()
     slide_buf       = SlidingAudioBuffer()
@@ -379,7 +356,6 @@ def main() -> None:
     finally:
         stream.stop()
         stream.close()
-        vad.reset_states()
 
 
 if __name__ == "__main__":
